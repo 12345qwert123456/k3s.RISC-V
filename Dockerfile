@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
     xz-utils \
     zstd \
     wget \
+    && if [ "$(uname -m)" = "x86_64" ]; then apt-get install -y gcc-riscv64-linux-gnu; fi \
     && rm -rf /var/lib/apt/lists/*
 
 # Build yq from source (no riscv64 binary available)
@@ -58,8 +59,11 @@ RUN mkdir -p build/data build/static pkg/static/embed && \
 RUN cp -r build/static/charts pkg/static/embed/charts
 
 # Build k3s for riscv64
-RUN GOARCH=riscv64 \
+# On amd64 (CI): use riscv64-linux-gnu-gcc for CGO; on riscv64 (native): use gcc
+RUN CC=$([ "$(uname -m)" = "x86_64" ] && echo "riscv64-linux-gnu-gcc" || echo "gcc") && \
+    GOARCH=riscv64 \
     GOOS=linux \
+    CC="${CC}" \
     SKIP_VALIDATE=true \
     SKIP_IMAGE=true \
     SKIP_AIRGAP=true \
