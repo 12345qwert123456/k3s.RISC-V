@@ -1,0 +1,7 @@
+k3s-new
+k3s
+flannel
+pause
+*.tar
+*.tar.gz
+SHA256SUMS

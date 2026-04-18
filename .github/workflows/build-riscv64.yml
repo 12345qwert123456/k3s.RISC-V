@@ -1,0 +1,164 @@
+name: Build k3s for RISC-V 64
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # daily at 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force rebuild even if release exists'
+        type: boolean
+        default: false
+      version:
+        description: 'Override version (e.g. v1.35.3+k3s1). Leave empty for latest.'
+        type: string
+        default: ''
+
+env:
+  IMAGE_NAME: k3s-riscv64
+  DOCKERHUB_REPO: ${{ vars.DOCKERHUB_USERNAME }}/k3s-riscv64
+
+permissions:
+  contents: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      version_tag: ${{ steps.resolve.outputs.version_tag }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Resolve version
+        id: resolve
+        run: |
+          if [[ -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(curl -sL https://api.github.com/repos/k3s-io/k3s/releases/latest \
+              | jq -r '.tag_name')
+          fi
+          # Replace + with - for use in tag names
+          VERSION_TAG=$(echo "${VERSION}" | sed 's/+/-/g')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version_tag=${VERSION_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved k3s version: ${VERSION}"
+
+      - name: Check if already built
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION_TAG="${{ steps.resolve.outputs.version_tag }}"
+          FORCE="${{ inputs.force }}"
+
+          if [[ "$FORCE" == "true" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Force build requested"
+            exit 0
+          fi
+
+          EXISTING=$(gh release view "${VERSION_TAG}-riscv64" \
+            --repo "${{ github.repository }}" \
+            --json tagName -q '.tagName' 2>/dev/null || echo "")
+
+          if [[ -n "$EXISTING" ]]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Release ${VERSION_TAG}-riscv64 already exists, skipping"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "No release for ${VERSION_TAG}-riscv64, will build"
+          fi
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
+      VERSION_TAG: ${{ needs.detect.outputs.version_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.VERSION_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Extract binaries
+        run: |
+          docker create --name extract ${{ env.IMAGE_NAME }}:${{ env.VERSION_TAG }} /k3s
+          docker cp extract:/k3s ./k3s
+          docker cp extract:/cni/ ./cni/
+          docker rm extract
+
+      - name: Verify binaries
+        run: |
+          file ./k3s
+          file ./k3s | grep -q "RISC-V" || { echo "ERROR: k3s is not a RISC-V binary"; exit 1; }
+          file ./cni/flannel | grep -q "RISC-V" || { echo "ERROR: flannel is not a RISC-V binary"; exit 1; }
+          echo "All binaries verified as RISC-V 64-bit ELF"
+          ls -lh k3s cni/
+
+      - name: Create release archive
+        run: |
+          tar czf k3s-${{ env.VERSION_TAG }}-linux-riscv64.tar.gz k3s cni/
+          sha256sum k3s-${{ env.VERSION_TAG }}-linux-riscv64.tar.gz > SHA256SUMS
+          ls -lh k3s-${{ env.VERSION_TAG }}-linux-riscv64.tar.gz
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push to Docker Hub
+        run: |
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION_TAG }} \
+            ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION_TAG }}
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION_TAG }} \
+            ${{ env.DOCKERHUB_REPO }}:latest
+          docker push ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION_TAG }}
+          docker push ${{ env.DOCKERHUB_REPO }}:latest
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ env.VERSION_TAG }}-riscv64" \
+            --repo "${{ github.repository }}" \
+            --title "k3s ${{ env.VERSION }} for RISC-V 64" \
+            --notes "k3s ${{ env.VERSION }} built for linux/riscv64.
+
+          **Install:**
+          \`\`\`bash
+          tar xzf k3s-${{ env.VERSION_TAG }}-linux-riscv64.tar.gz
+          sudo install -m 755 k3s /usr/local/bin/k3s
+          sudo ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl
+          sudo ln -sf /usr/local/bin/k3s /usr/local/bin/crictl
+          sudo ln -sf /usr/local/bin/k3s /usr/local/bin/ctr
+          sudo mkdir -p /opt/cni/bin
+          sudo install -m 755 cni/* /opt/cni/bin/
+          \`\`\`
+
+          **Docker image:**
+          \`\`\`bash
+          docker pull ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION_TAG }}
+          \`\`\`
+
+          Based on [CARV-ICS-FORTH/kubernetes-riscv64](https://github.com/CARV-ICS-FORTH/kubernetes-riscv64) patches." \
+            k3s-${{ env.VERSION_TAG }}-linux-riscv64.tar.gz \
+            SHA256SUMS
