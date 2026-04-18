@@ -157,17 +157,18 @@ The workflow:
 
 | File | Description |
 |---|---|
-| `Dockerfile` | Builds k3s and all CNI plugins for riscv64 (run on RISC-V device) |
+| `Dockerfile` | Builds k3s and flannel for riscv64 (run on RISC-V device or via QEMU in CI) |
 | `install.sh` | Downloads latest release and installs k3s |
 | `.github/workflows/build-riscv64.yml` | GitHub Actions workflow |
 
 ## Dependencies
 
-- CNI plugins v1.9.1-k3s1 (bridge, host-local, portmap, and more)
-- flannel CNI plugin v1.9.0-flannel1
+- CNI plugins v1.6.2 — [official containernetworking/plugins](https://github.com/containernetworking/plugins/releases/tag/v1.6.2) (bridge, host-local, portmap, and more)
+- flannel CNI plugin v1.9.0-flannel1 (built from source — no official riscv64 binary available)
 - pause image: [carvicsforth/pause:v3.10-v1.31.1](https://hub.docker.com/r/carvicsforth/pause)
 
 ## Credits
 
 - [CARV-ICS-FORTH](https://github.com/CARV-ICS-FORTH/kubernetes-riscv64) — original riscv64 k3s patches and container images
 - [k3s-io/k3s](https://github.com/k3s-io/k3s) — upstream k3s project
+- [containernetworking/plugins](https://github.com/containernetworking/plugins) — standard CNI plugins

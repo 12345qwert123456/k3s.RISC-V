@@ -65,22 +65,14 @@ RUN GOARCH=riscv64 \
     SKIP_AIRGAP=true \
     ./scripts/build
 
-# Build all CNI plugins
-RUN git clone --depth=1 --branch v1.9.1-k3s1 \
-    https://github.com/rancher/plugins.git /cni-plugins && \
-    cd /cni-plugins && \
-    GOARCH=riscv64 CGO_ENABLED=0 ./build_linux.sh && \
-    mkdir -p /output/cni && \
-    cp bin/* /output/cni/
-
 # Build flannel CNI plugin
-RUN git clone --depth=1 --branch v1.9.0-flannel1 \
+RUN mkdir -p /output/cni && \
+    git clone --depth=1 --branch v1.9.0-flannel1 \
     https://github.com/flannel-io/cni-plugin.git /flannel-cni && \
     cd /flannel-cni && \
     GOARCH=riscv64 CGO_ENABLED=0 go build -o /output/cni/flannel .
 
-RUN mkdir -p /output && \
-    cp /k3s/bin/k3s /output/k3s
+RUN cp /k3s/bin/k3s /output/k3s
 
 FROM scratch
 COPY --from=0 /output/k3s /k3s
