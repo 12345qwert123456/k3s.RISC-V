@@ -1,14 +1,19 @@
-FROM golang:1.25.9
+FROM golang:latest
 
-RUN apt-get update && apt-get install -y \
+RUN dpkg --add-architecture riscv64 && apt-get update && apt-get install -y \
     libbtrfs-dev \
     make \
     git \
     gcc \
+    gcc-riscv64-linux-gnu \
+    g++-riscv64-linux-gnu \
+    libc6-dev-riscv64-cross \
+    binutils-riscv64-linux-gnu \
     curl \
     jq \
     pkg-config \
     libseccomp-dev \
+    libseccomp-dev:riscv64 \
     squashfs-tools \
     xz-utils \
     zstd \
@@ -60,6 +65,8 @@ RUN cp -r build/static/charts pkg/static/embed/charts
 # Build k3s for riscv64
 RUN GOARCH=riscv64 \
     GOOS=linux \
+    CC=riscv64-linux-gnu-gcc \
+    CXX=riscv64-linux-gnu-g++ \
     SKIP_VALIDATE=true \
     SKIP_IMAGE=true \
     SKIP_AIRGAP=true \
