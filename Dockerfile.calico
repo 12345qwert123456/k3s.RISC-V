@@ -1,0 +1,109 @@
+FROM golang:latest
+
+RUN dpkg --add-architecture riscv64 && apt-get update && apt-get install -y \
+    make \
+    git \
+    gcc \
+    gcc-riscv64-linux-gnu \
+    g++-riscv64-linux-gnu \
+    libc6-dev-riscv64-cross \
+    binutils-riscv64-linux-gnu \
+    curl \
+    jq \
+    pkg-config \
+    autoconf \
+    automake \
+    libtool \
+    flex \
+    bison \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone Calico
+RUN LATEST_TAG=$(curl -s https://api.github.com/repos/projectcalico/calico/releases/latest | jq -r '.tag_name') && \
+    echo "${LATEST_TAG}" > /calico_version && \
+    git clone --depth=1 --branch ${LATEST_TAG} https://github.com/projectcalico/calico.git /calico
+
+WORKDIR /calico
+RUN mkdir -p /output/node /output/cni
+
+# Build the combined calico-node binary (cmd/calico), the mountns helper,
+# and kube-controllers, cross-compiled for riscv64 - same GOARCH pattern
+# already used for k3s and flannel in ../Dockerfile.
+#
+# Upstream builds this same package two ways: a plain CGO_ENABLED=0 build
+# (Makefile target `build`) and a `build-cgo` variant that statically links
+# libbpf to enable Calico's optional eBPF dataplane. We use the plain,
+# non-cgo build: the eBPF dataplane is opt-in (off by default; the default
+# dataplane is iptables/BGP) and pulling in libbpf plus Felix's BPF program
+# toolchain for an architecture upstream has never targeted is out of scope
+# here. This means the eBPF dataplane option will not be available on this
+# build - iptables/BGP mode is what's supported.
+RUN GOARCH=riscv64 GOOS=linux CGO_ENABLED=0 go build -o /output/node/calico-node ./cmd/calico && \
+    GOARCH=riscv64 GOOS=linux CGO_ENABLED=0 go build -o /output/node/mountns ./node/cmd/mountns && \
+    GOARCH=riscv64 GOOS=linux CGO_ENABLED=0 go build -o /output/node/kube-controllers ./kube-controllers/cmd/kube-controllers
+
+# Build the Calico CNI plugin. Upstream ships one binary that dispatches on
+# argv[0] ("calico" vs "calico-ipam" - see cni-plugin/cmd/calico/calico.go),
+# so both names are just copies of the same binary.
+RUN GOARCH=riscv64 GOOS=linux CGO_ENABLED=0 go build -o /output/cni/calico ./cni-plugin/cmd/calico && \
+    cp /output/cni/calico /output/cni/calico-ipam
+
+# Build BIRD (the BGP daemon calico-node drives) and its CLI from Calico's
+# fork. No riscv64 binary or image is published upstream - calico/node
+# normally pulls a prebuilt calico/bird image - so this cross-compiles it
+# with the same riscv64-linux-gnu toolchain used for k3s in ../Dockerfile,
+# following the same static-binary recipe upstream's own
+# create_binaries.sh uses (one build with IPv6 -> bird6/birdcl6, one
+# without -> bird/birdcl).
+ARG BIRD_VERSION=v0.3.2
+RUN git clone --depth=1 --branch ${BIRD_VERSION} https://github.com/projectcalico/bird.git /bird-src
+
+WORKDIR /bird-src
+RUN autoreconf -fi
+
+RUN ./configure --with-protocols="bfd bgp pipe static" --enable-ipv6=yes --enable-client=no \
+        --enable-pthreads=yes --with-sysconfig=linux-v6 --host=riscv64-linux-gnu \
+        --runstatedir=/var/run/calico && \
+    make && \
+    rm -f bird birdcl && \
+    make CC="riscv64-linux-gnu-gcc --static" bird birdcl && \
+    cp bird /output/node/bird6 && \
+    cp birdcl /output/node/birdcl6 && \
+    make clean
+
+RUN ./configure --with-protocols="bfd bgp pipe static" --enable-client=no \
+        --enable-pthreads=yes --with-sysconfig=linux --host=riscv64-linux-gnu \
+        --runstatedir=/var/run/calico && \
+    make && \
+    rm -f bird birdcl && \
+    make CC="riscv64-linux-gnu-gcc --static" bird birdcl && \
+    cp bird /output/node/bird && \
+    cp birdcl /output/node/birdcl
+
+# Final runtime image. Upstream calico/node runs on Red Hat UBI + AlmaLinux
+# with a custom-patched nftables/libnftnl RPM build - none of that has
+# riscv64 support (UBI/RHEL don't target RISC-V at all), so this assembles
+# a clean-room equivalent runtime instead: a plain Debian riscv64 base with
+# the standard iptables/ipset/conntrack packages Debian already publishes
+# for riscv64, in place of upstream's patched RPMs.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    iptables \
+    ipset \
+    conntrack \
+    iproute2 \
+    net-tools \
+    kmod \
+    procps \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=0 /output/node/ /usr/bin/
+COPY --from=0 /output/cni/ /cni/
+ENV PATH="/usr/bin:${PATH}"
+# calico-node's own dispatch (cmd/calico) picks its mode from argv[0] or a
+# leading subcommand - verify the exact invocation against
+# `calico-node --help` from the built riscv64 binary (e.g. under QEMU in
+# CI) and adjust this ENTRYPOINT/CMD if it differs.
+ENTRYPOINT ["/usr/bin/calico-node"]
+CMD ["-felix"]

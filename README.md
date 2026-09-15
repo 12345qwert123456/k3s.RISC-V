@@ -145,30 +145,64 @@ sudo mkdir -p /opt/cni/bin
 sudo install -m 755 cni/* /opt/cni/bin/
 ```
 
+## Alternative CNIs (experimental)
+
+k3s ships with flannel by default (see above). This repo also cross-builds **Calico** and **Cilium** for riscv64, for anyone who wants BGP routing/network policy (Calico) or an eBPF datapath (Cilium) instead.
+
+> **Neither project publishes official riscv64 binaries or images.** These are best-effort community builds, not upstream releases. Read the caveats below before relying on either in anything but a test cluster.
+
+| Image | Built from | Status |
+|---|---|---|
+| `<DOCKERHUB_USERNAME>/calico-node-riscv64` | [projectcalico/calico](https://github.com/projectcalico/calico) (combined `calico-node` binary, non-cgo build) + BIRD ([projectcalico/bird](https://github.com/projectcalico/bird) `v0.3.2`, cross-compiled) + kube-controllers | Experimental. Standard iptables/BGP dataplane only — the optional eBPF dataplane isn't built (it needs libbpf/cgo, skipped here). BIRD/BGP behavior is unverified on real riscv64 hardware. |
+| `<DOCKERHUB_USERNAME>/cilium-riscv64` | [cilium/cilium](https://github.com/cilium/cilium) (`cilium-agent`, `cilium-operator-generic`, `cilium-cni`) | Highly experimental. **cilium-envoy (L7 proxy) is not included** — no HTTP-aware policies. The eBPF datapath compiles at agent startup on the target node (matching upstream's own design) and requires a kernel with riscv64 eBPF JIT support (mainlined around Linux 5.19+); this cannot be verified in CI, only on real hardware. |
+
+Built by `Dockerfile.calico` / `Dockerfile.cilium` via `.github/workflows/build-calico-riscv64.yml` / `build-cilium-riscv64.yml`, independently of the k3s build so a failure in either doesn't block k3s releases.
+
+To use one instead of flannel, disable flannel and Calico/Cilium's own network-policy controller isn't needed either way:
+
+```bash
+# in /etc/rancher/k3s/config.yaml
+flannel-backend: "none"
+disable-network-policy: true
+```
+
+then `kubectl apply` a Calico or Cilium manifest edited to reference the images above instead of the stock `calico/node` / `cilium/cilium` images.
+
 ## GitHub Actions
 
-The workflow:
+The main workflow (`build-riscv64.yml`):
 1. Checks for a new k3s release daily
 2. Cross-compiles k3s and CNI plugins for riscv64
 3. Pushes the Docker image to Docker Hub
 4. Creates a GitHub Release with a `k3s-<version>-linux-riscv64.tar.gz` archive
+
+`build-calico-riscv64.yml` and `build-cilium-riscv64.yml` follow the same pattern (daily check, cross-compile, push, release) for the images in [Alternative CNIs](#alternative-cnis-experimental) above, on their own schedule and release train.
 
 ## Files
 
 | File | Description |
 |---|---|
 | `Dockerfile` | Builds k3s and flannel for riscv64 (run on RISC-V device or via QEMU in CI) |
+| `Dockerfile.calico` | Builds Calico (calico-node, kube-controllers, BIRD, CNI plugin) for riscv64 — experimental |
+| `Dockerfile.cilium` | Builds Cilium (agent, operator, CNI plugin) for riscv64 — experimental |
 | `install.sh` | Downloads latest release and installs k3s |
-| `.github/workflows/build-riscv64.yml` | GitHub Actions workflow |
+| `.github/workflows/build-riscv64.yml` | GitHub Actions workflow for k3s |
+| `.github/workflows/build-calico-riscv64.yml` | GitHub Actions workflow for Calico |
+| `.github/workflows/build-cilium-riscv64.yml` | GitHub Actions workflow for Cilium |
 
 ## Dependencies
 
 - CNI plugins v1.6.2 — [official containernetworking/plugins](https://github.com/containernetworking/plugins/releases/tag/v1.6.2) (bridge, host-local, portmap, and more)
 - flannel CNI plugin v1.9.0-flannel1 (built from source — no official riscv64 binary available)
 - pause image: [carvicsforth/pause:v3.10-v1.31.1](https://hub.docker.com/r/carvicsforth/pause)
+- Calico (built from source, no official riscv64 support — see [Alternative CNIs](#alternative-cnis-experimental))
+- BIRD v0.3.2, [projectcalico/bird](https://github.com/projectcalico/bird) fork (built from source)
+- Cilium (built from source, no official riscv64 support — see [Alternative CNIs](#alternative-cnis-experimental))
 
 ## Credits
 
 - [CARV-ICS-FORTH](https://github.com/CARV-ICS-FORTH/kubernetes-riscv64) — original riscv64 k3s patches and container images
 - [k3s-io/k3s](https://github.com/k3s-io/k3s) — upstream k3s project
 - [containernetworking/plugins](https://github.com/containernetworking/plugins) — standard CNI plugins
+- [projectcalico/calico](https://github.com/projectcalico/calico) and [projectcalico/bird](https://github.com/projectcalico/bird) — Calico
+- [cilium/cilium](https://github.com/cilium/cilium) — Cilium
