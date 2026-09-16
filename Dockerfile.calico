@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 FROM golang:latest
 
 RUN dpkg --add-architecture riscv64 && apt-get update && apt-get install -y \
@@ -26,57 +27,146 @@ RUN LATEST_TAG=$(curl -s https://api.github.com/repos/projectcalico/calico/relea
 WORKDIR /calico
 RUN mkdir -p /output/node /output/cni
 
-# Build the combined calico-node binary (cmd/calico), the mountns helper,
-# and kube-controllers, cross-compiled for riscv64 - same GOARCH pattern
-# already used for k3s and flannel in ../Dockerfile.
+# Build the combined calico-node binary (node/cmd/calico-node), the mountns
+# helper, and kube-controllers, cross-compiled for riscv64 - same GOARCH
+# pattern already used for k3s and flannel in ../Dockerfile.
 #
-# Upstream builds this same package two ways: a plain CGO_ENABLED=0 build
-# (Makefile target `build`) and a `build-cgo` variant that statically links
-# libbpf to enable Calico's optional eBPF dataplane. We use the plain,
-# non-cgo build: the eBPF dataplane is opt-in (off by default; the default
-# dataplane is iptables/BGP) and pulling in libbpf plus Felix's BPF program
-# toolchain for an architecture upstream has never targeted is out of scope
-# here. This means the eBPF dataplane option will not be available on this
-# build - iptables/BGP mode is what's supported.
-RUN GOARCH=riscv64 GOOS=linux CGO_ENABLED=0 go build -o /output/node/calico-node ./cmd/calico && \
+# Upstream's own node/Makefile builds this package with cgo (for the eBPF
+# dataplane) only on amd64/arm64/ppc64le, and falls back to a plain
+# CGO_ENABLED=0 build (its `build_binary` macro) for every other
+# architecture - so riscv64 using CGO_ENABLED=0 here matches upstream's own
+# choice for "other" architectures, not a deviation from it. This means the
+# eBPF dataplane option will not be available on this build - iptables/BGP
+# mode is what's supported.
+# Module downloads from a QEMU-emulated container can be slow enough to hit
+# transient TLS/proxy timeouts; cache mounts make a retry resume instead of
+# re-downloading Calico's (large, k8s.io-heavy) module graph from scratch.
+RUN --mount=type=cache,target=/root/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    GOARCH=riscv64 GOOS=linux CGO_ENABLED=0 go build -o /output/node/calico-node ./node/cmd/calico-node && \
     GOARCH=riscv64 GOOS=linux CGO_ENABLED=0 go build -o /output/node/mountns ./node/cmd/mountns && \
     GOARCH=riscv64 GOOS=linux CGO_ENABLED=0 go build -o /output/node/kube-controllers ./kube-controllers/cmd/kube-controllers
 
 # Build the Calico CNI plugin. Upstream ships one binary that dispatches on
 # argv[0] ("calico" vs "calico-ipam" - see cni-plugin/cmd/calico/calico.go),
 # so both names are just copies of the same binary.
-RUN GOARCH=riscv64 GOOS=linux CGO_ENABLED=0 go build -o /output/cni/calico ./cni-plugin/cmd/calico && \
+RUN --mount=type=cache,target=/root/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    GOARCH=riscv64 GOOS=linux CGO_ENABLED=0 go build -o /output/cni/calico ./cni-plugin/cmd/calico && \
     cp /output/cni/calico /output/cni/calico-ipam
 
 # Build BIRD (the BGP daemon calico-node drives) and its CLI from Calico's
 # fork. No riscv64 binary or image is published upstream - calico/node
 # normally pulls a prebuilt calico/bird image - so this cross-compiles it
-# with the same riscv64-linux-gnu toolchain used for k3s in ../Dockerfile,
-# following the same static-binary recipe upstream's own
-# create_binaries.sh uses (one build with IPv6 -> bird6/birdcl6, one
-# without -> bird/birdcl).
+# with the same riscv64-linux-gnu toolchain used for k3s in ../Dockerfile.
+# Two builds, one with IPv6 -> bird6/birdcl6, one without -> bird/birdcl,
+# matching the pair upstream's own create_binaries.sh produces (that script
+# additionally does a non-static build first, deletes it, then rebuilds
+# with -static by naming "bird"/"birdcl" as explicit make targets from its
+# own out-of-tree build directory; that target-name approach doesn't
+# resolve the same way against this in-tree obj/ layout, and isn't needed
+# here anyway since we don't need the intermediate dynamic build - a single
+# static-from-the-start `make` produces the same result).
 ARG BIRD_VERSION=v0.3.2
 RUN git clone --depth=1 --branch ${BIRD_VERSION} https://github.com/projectcalico/bird.git /bird-src
 
 WORKDIR /bird-src
+# This fork's configure.in predates autoconf's AH_TEMPLATE requirement: it
+# calls AC_DEFINE(SYMBOL) without a description, which used to rely on a
+# companion acconfig.h listing #undef templates for autoheader. That file
+# was never committed upstream, so a modern autoheader (as ships in the
+# golang:latest base image) fails outright instead of just warning. Provide
+# the missing templates ourselves - the symbol list here is exactly what
+# autoheader reports missing for this configure.in.
+RUN printf '%s\n' \
+    '#undef CPU_BIG_ENDIAN' \
+    '#undef CPU_LITTLE_ENDIAN' \
+    '#undef CPU_STRUCT_ALIGN' \
+    '#undef DEBUGGING' \
+    '#undef HAVE_ALLOCA_H' \
+    '#undef HAVE_RL_CRLF' \
+    '#undef HAVE_RL_DING' \
+    '#undef HAVE_STRUCT_IP_MREQN' \
+    '#undef HAVE_SYSLOG' \
+    '#undef SYSCONF_INCLUDE' \
+    '#undef TIME_T_IS_64BIT' \
+    '#undef TIME_T_IS_SIGNED' \
+    '#undef USE_PTHREADS' \
+    > acconfig.h
 RUN autoreconf -fi
 
+# Two of configure's checks (struct alignment, time_t size/signedness) run a
+# compiled test binary to determine their answer. That's normally skipped
+# when cross-compiling in favor of a built-in fallback - but because this
+# container can actually execute riscv64 binaries via QEMU (see the
+# binfmt/buildx platform setup this image is built under), configure
+# doesn't detect it as cross-compiling and tries to run the test binary for
+# real, which fails here (most likely a QEMU user-mode emulation quirk with
+# the unaligned-access probing these particular tests do). Pre-seed the
+# cache variables these checks would otherwise compute, with the values
+# that are correct for any 64-bit Linux target (matching what the macros'
+# own cross-compiling fallback already assumes for struct alignment, and
+# what every other 64-bit Linux arch has for time_t):
+#   bird_cv_c_struct_align=16, bird_cv_type_time_t="64-bit signed"
+# (see aclocal.m4's BIRD_CHECK_STRUCT_ALIGN / BIRD_CHECK_TIME_T).
+# configure.in's BIRD_CHECK_INTEGERS builds macro names dynamically
+# (AC_DEFINE_UNQUOTED(INTEGER_$bits, $res)), which autoheader can't resolve
+# by static analysis - so it emits no INTEGER_8/16/32/64 template at all in
+# the freshly autoreconf'd header (confirmed: they're entirely absent from
+# the generated obj/sysdep/autoconf.h, not left over as any placeholder
+# text), breaking the u8/u16/u32/u64 typedefs in sysdep/config.h at compile
+# time. Append them directly with the same 8/16/32/64-bit C types configure
+# already detects correctly (visible in its own "checking for N-bit type"
+# output: char/short int/int/long int) for any standard 64-bit Linux target.
+#
+# -fcommon: this K&R-style C code declares the same globals (e.g. kif_proto
+# in lib/krt.h) in headers included by multiple .c files, relying on the
+# old "tentative definition" linkage GCC stopped defaulting to at GCC 10
+# (-fno-common became the default) - unrelated to riscv64, this would break
+# the same way building this code with any modern GCC.
+#
+# CONFIG_<PROTO>: configure.in defines these the same dynamic way as
+# INTEGER_$bits above (AC_DEFINE_UNQUOTED(CONFIG_`echo $a | tr a-z A-Z`)
+# looping over --with-protocols), so they're equally absent from the
+# generated header regardless of which protocols are requested - without
+# them each protocol's *.h falls back to a stub implementation while its
+# *.c still defines the real one, causing "conflicting types" redefinition
+# errors like bfd_request_session below. Define the ones matching our
+# --with-protocols selection (bfd bgp pipe static) ourselves.
 RUN ./configure --with-protocols="bfd bgp pipe static" --enable-ipv6=yes --enable-client=no \
         --enable-pthreads=yes --with-sysconfig=linux-v6 --host=riscv64-linux-gnu \
-        --runstatedir=/var/run/calico && \
-    make && \
-    rm -f bird birdcl && \
-    make CC="riscv64-linux-gnu-gcc --static" bird birdcl && \
+        --runstatedir=/var/run/calico \
+        bird_cv_c_struct_align=16 bird_cv_type_time_t="64-bit signed" && \
+    printf '%s\n' \
+        '#define INTEGER_8 char' \
+        '#define INTEGER_16 short int' \
+        '#define INTEGER_32 int' \
+        '#define INTEGER_64 long int' \
+        '#define CONFIG_BFD 1' \
+        '#define CONFIG_BGP 1' \
+        '#define CONFIG_PIPE 1' \
+        '#define CONFIG_STATIC 1' \
+        >> obj/sysdep/autoconf.h && \
+    make CC="riscv64-linux-gnu-gcc --static -fcommon" && \
     cp bird /output/node/bird6 && \
     cp birdcl /output/node/birdcl6 && \
     make clean
 
 RUN ./configure --with-protocols="bfd bgp pipe static" --enable-client=no \
         --enable-pthreads=yes --with-sysconfig=linux --host=riscv64-linux-gnu \
+        bird_cv_c_struct_align=16 bird_cv_type_time_t="64-bit signed" \
         --runstatedir=/var/run/calico && \
-    make && \
-    rm -f bird birdcl && \
-    make CC="riscv64-linux-gnu-gcc --static" bird birdcl && \
+    printf '%s\n' \
+        '#define INTEGER_8 char' \
+        '#define INTEGER_16 short int' \
+        '#define INTEGER_32 int' \
+        '#define INTEGER_64 long int' \
+        '#define CONFIG_BFD 1' \
+        '#define CONFIG_BGP 1' \
+        '#define CONFIG_PIPE 1' \
+        '#define CONFIG_STATIC 1' \
+        >> obj/sysdep/autoconf.h && \
+    make CC="riscv64-linux-gnu-gcc --static -fcommon" && \
     cp bird /output/node/bird && \
     cp birdcl /output/node/birdcl
 
@@ -85,8 +175,9 @@ RUN ./configure --with-protocols="bfd bgp pipe static" --enable-client=no \
 # riscv64 support (UBI/RHEL don't target RISC-V at all), so this assembles
 # a clean-room equivalent runtime instead: a plain Debian riscv64 base with
 # the standard iptables/ipset/conntrack packages Debian already publishes
-# for riscv64, in place of upstream's patched RPMs.
-FROM debian:bookworm-slim
+# for riscv64, in place of upstream's patched RPMs. Debian only publishes a
+# riscv64 manifest from trixie (13) onward - bookworm (12) has none.
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     iptables \
     ipset \
@@ -101,9 +192,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=0 /output/node/ /usr/bin/
 COPY --from=0 /output/cni/ /cni/
 ENV PATH="/usr/bin:${PATH}"
-# calico-node's own dispatch (cmd/calico) picks its mode from argv[0] or a
-# leading subcommand - verify the exact invocation against
-# `calico-node --help` from the built riscv64 binary (e.g. under QEMU in
-# CI) and adjust this ENTRYPOINT/CMD if it differs.
+# -felix is a real flag on this build (confirmed by running the built
+# riscv64 binary's own -help under QEMU: it also exposes -confd, -init,
+# -bird-live/-bird-ready etc.) - it runs Felix alone. Upstream's real
+# calico-node entrypoint additionally supervises confd and BIRD as
+# separate processes via runit, which this minimal image doesn't set up;
+# running just Felix here is enough for iptables/BGP-dataplane basics but
+# not a full production supervision setup - see README.md.
 ENTRYPOINT ["/usr/bin/calico-node"]
 CMD ["-felix"]

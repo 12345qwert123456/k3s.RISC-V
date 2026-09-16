@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Cilium for riscv64 - EXPERIMENTAL, see the "Alternative CNIs" section of
 # README.md before using this in anything but a test cluster.
 #
@@ -45,21 +46,29 @@ RUN LATEST_TAG=$(curl -s https://api.github.com/repos/cilium/cilium/releases/lat
 WORKDIR /cilium
 RUN mkdir -p /output/cni
 
-# cilium-agent and cilium-operator, cross-compiled for riscv64. Try
-# CGO_ENABLED=0 first (matches the flannel/k3s CNI-plugin pattern already
-# used elsewhere in this repo); if the build fails because something in
-# these packages hard-requires cgo, drop CGO_ENABLED=0 and add
-# CC=riscv64-linux-gnu-gcc CXX=riscv64-linux-gnu-g++ instead, the same way
-# ../Dockerfile builds k3s itself.
+# cilium-agent and cilium-operator, cross-compiled for riscv64 with
+# CGO_ENABLED=0 (matches the flannel/k3s CNI-plugin pattern already used
+# elsewhere in this repo) - confirmed this builds cleanly and the
+# resulting riscv64 binaries actually run under QEMU (`--version` reports
+# "go1.x linux/riscv64" correctly for both).
 #
 # cilium-operator-generic is selected via a build tag upstream
-# (see operator/Makefile / OPERATOR_VARIANT) - if the plain build below
-# produces the wrong provider variant, add that tag here.
-RUN GOARCH=riscv64 GOOS=linux CGO_ENABLED=0 go build -o /output/cilium-agent ./daemon && \
+# (see operator/Makefile / OPERATOR_VARIANT) - the plain build below
+# produced a binary named/versioned as "Cilium-Operator" generically, which
+# matches what's needed here; revisit if a specific cloud-provider variant
+# is ever required.
+# Module downloads from a QEMU-emulated container can be slow enough to hit
+# transient TLS/proxy timeouts; cache mounts make a retry resume instead of
+# re-downloading Cilium's module graph from scratch.
+RUN --mount=type=cache,target=/root/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    GOARCH=riscv64 GOOS=linux CGO_ENABLED=0 go build -o /output/cilium-agent ./daemon && \
     GOARCH=riscv64 GOOS=linux CGO_ENABLED=0 go build -o /output/cilium-operator-generic ./operator
 
 # Cilium's CNI plugin binary
-RUN GOARCH=riscv64 GOOS=linux CGO_ENABLED=0 go build -o /output/cni/cilium-cni ./plugins/cilium-cni
+RUN --mount=type=cache,target=/root/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    GOARCH=riscv64 GOOS=linux CGO_ENABLED=0 go build -o /output/cni/cilium-cni ./plugins/cilium-cni
 
 # BPF datapath C sources - copied as-is, compiled at agent startup on the
 # target node (see header comment above), not here.
@@ -72,7 +81,9 @@ RUN cp -r bpf /output/bpf
 # of clang/iproute2 here come from Debian, not from Cilium's own pinned
 # toolchain - if the startup-time BPF compile fails on real hardware due
 # to a clang/kernel-header mismatch, this is the first place to look.
-FROM debian:bookworm-slim
+# Debian only publishes a riscv64 manifest from trixie (13) onward -
+# bookworm (12) has none.
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     clang \
     llvm \
