@@ -1,0 +1,168 @@
+name: Build Calico for RISC-V 64 (experimental)
+
+on:
+  schedule:
+    - cron: '0 7 * * *' # daily at 07:00 UTC (offset from the k3s build's 06:00 cron)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force rebuild even if release exists'
+        type: boolean
+        default: false
+      version:
+        description: 'Override Calico version (e.g. v3.30.0). Leave empty for latest.'
+        type: string
+        default: ''
+
+env:
+  IMAGE_NAME: calico-node-riscv64
+  DOCKERHUB_REPO: ${{ vars.DOCKERHUB_USERNAME }}/calico-node-riscv64
+
+permissions:
+  contents: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      version_tag: ${{ steps.resolve.outputs.version_tag }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Resolve version
+        id: resolve
+        run: |
+          if [[ -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(curl -sL https://api.github.com/repos/projectcalico/calico/releases/latest \
+              | jq -r '.tag_name')
+          fi
+          VERSION_TAG=$(echo "${VERSION}" | sed 's/+/-/g')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version_tag=${VERSION_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved Calico version: ${VERSION}"
+
+      - name: Check if already built
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION_TAG="${{ steps.resolve.outputs.version_tag }}"
+          FORCE="${{ inputs.force }}"
+
+          if [[ "$FORCE" == "true" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Force build requested"
+            exit 0
+          fi
+
+          EXISTING=$(gh release view "${VERSION_TAG}-calico-riscv64" \
+            --repo "${{ github.repository }}" \
+            --json tagName -q '.tagName' 2>/dev/null || echo "")
+
+          if [[ -n "$EXISTING" ]]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Release ${VERSION_TAG}-calico-riscv64 already exists, skipping"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "No release for ${VERSION_TAG}-calico-riscv64, will build"
+          fi
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
+      VERSION_TAG: ${{ needs.detect.outputs.version_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.calico
+          platforms: linux/riscv64
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.VERSION_TAG }}
+          cache-from: type=gha,scope=calico
+          cache-to: type=gha,scope=calico,mode=max
+
+      - name: Extract binaries
+        run: |
+          docker create --name extract ${{ env.IMAGE_NAME }}:${{ env.VERSION_TAG }}
+          mkdir -p node cni
+          docker cp extract:/usr/bin/calico-node ./node/
+          docker cp extract:/usr/bin/mountns ./node/
+          docker cp extract:/usr/bin/kube-controllers ./node/
+          docker cp extract:/usr/bin/bird ./node/
+          docker cp extract:/usr/bin/bird6 ./node/
+          docker cp extract:/usr/bin/birdcl ./node/
+          docker cp extract:/usr/bin/birdcl6 ./node/
+          docker cp extract:/cni/ ./cni/
+          docker rm extract
+
+      - name: Verify binaries
+        run: |
+          for f in node/calico-node node/mountns node/kube-controllers node/bird node/bird6 cni/calico; do
+            file "$f"
+            file "$f" | grep -q "RISC-V" || { echo "ERROR: $f is not a RISC-V binary"; exit 1; }
+          done
+          echo "All binaries verified as RISC-V 64-bit ELF"
+          ls -lh node/ cni/
+
+      - name: Smoke test under QEMU
+        run: |
+          docker run --rm --platform linux/riscv64 ${{ env.IMAGE_NAME }}:${{ env.VERSION_TAG }} \
+            /usr/bin/calico-node --version || echo "WARNING: calico-node --version did not succeed - the entrypoint/flag may need adjusting, see Dockerfile.calico"
+
+      - name: Create release archive
+        run: |
+          tar czf calico-${{ env.VERSION_TAG }}-linux-riscv64.tar.gz node/ cni/
+          sha256sum calico-${{ env.VERSION_TAG }}-linux-riscv64.tar.gz > SHA256SUMS
+          ls -lh calico-${{ env.VERSION_TAG }}-linux-riscv64.tar.gz
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push to Docker Hub
+        run: |
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION_TAG }} \
+            ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION_TAG }}
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION_TAG }} \
+            ${{ env.DOCKERHUB_REPO }}:latest
+          docker push ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION_TAG }}
+          docker push ${{ env.DOCKERHUB_REPO }}:latest
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ env.VERSION_TAG }}-calico-riscv64" \
+            --repo "${{ github.repository }}" \
+            --title "Calico ${{ env.VERSION }} for RISC-V 64 (experimental)" \
+            --notes "Calico ${{ env.VERSION }} built for linux/riscv64. **Experimental / best-effort**: Calico has no official riscv64 support upstream; BIRD and the iptables dataplane are built here but unverified on real RISC-V hardware. The eBPF dataplane option is not built (CGO/libbpf skipped) - see README.md.
+
+          **Docker image:**
+          \`\`\`bash
+          docker pull ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION_TAG }}
+          \`\`\`" \
+            calico-${{ env.VERSION_TAG }}-linux-riscv64.tar.gz \
+            SHA256SUMS

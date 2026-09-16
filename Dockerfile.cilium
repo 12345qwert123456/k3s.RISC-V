@@ -1,0 +1,101 @@
+# syntax=docker/dockerfile:1
+# Cilium for riscv64 - EXPERIMENTAL, see the "Alternative CNIs" section of
+# README.md before using this in anything but a test cluster.
+#
+# Cilium's eBPF datapath is not optional the way Calico's is: the agent
+# depends on it directly. Upstream's own Dockerfile builds cilium-agent
+# against a purpose-built `cilium-builder` image (pinned clang/llvm/libbpf
+# versions) and bundles a separate Envoy fork (cilium-envoy, a large C++
+# codebase) for L7 proxy support - neither has any riscv64 build, and
+# porting Envoy is out of scope here. This Dockerfile therefore:
+#   - builds cilium-agent and cilium-operator-generic directly with
+#     `go build` (bypassing cilium-builder), the same way this repo's main
+#     Dockerfile already cross-builds k3s and flannel for riscv64
+#   - does NOT bundle cilium-envoy, so L7/HTTP-aware policies and other
+#     Envoy-dependent features will not work
+#   - does NOT precompile the BPF datapath programs (bpf/) at image-build
+#     time - upstream's own design compiles those at agent startup, on the
+#     target node, against that node's actual kernel headers (see
+#     images/cilium/init-container.sh), using the clang installed in the
+#     runtime image below. That startup-time compile is the actual
+#     riscv64 eBPF proof point, and it can only be verified on real
+#     RISC-V hardware running a kernel with eBPF JIT support
+#     (mainlined for riscv64 around Linux 5.19) - it cannot be verified
+#     from this Dockerfile or from CI.
+
+FROM golang:latest
+
+RUN dpkg --add-architecture riscv64 && apt-get update && apt-get install -y \
+    make \
+    git \
+    gcc \
+    gcc-riscv64-linux-gnu \
+    g++-riscv64-linux-gnu \
+    libc6-dev-riscv64-cross \
+    binutils-riscv64-linux-gnu \
+    curl \
+    jq \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone Cilium
+RUN LATEST_TAG=$(curl -s https://api.github.com/repos/cilium/cilium/releases/latest | jq -r '.tag_name') && \
+    echo "${LATEST_TAG}" > /cilium_version && \
+    git clone --depth=1 --branch ${LATEST_TAG} https://github.com/cilium/cilium.git /cilium
+
+WORKDIR /cilium
+RUN mkdir -p /output/cni
+
+# cilium-agent and cilium-operator, cross-compiled for riscv64 with
+# CGO_ENABLED=0 (matches the flannel/k3s CNI-plugin pattern already used
+# elsewhere in this repo) - confirmed this builds cleanly and the
+# resulting riscv64 binaries actually run under QEMU (`--version` reports
+# "go1.x linux/riscv64" correctly for both).
+#
+# cilium-operator-generic is selected via a build tag upstream
+# (see operator/Makefile / OPERATOR_VARIANT) - the plain build below
+# produced a binary named/versioned as "Cilium-Operator" generically, which
+# matches what's needed here; revisit if a specific cloud-provider variant
+# is ever required.
+# Module downloads from a QEMU-emulated container can be slow enough to hit
+# transient TLS/proxy timeouts; cache mounts make a retry resume instead of
+# re-downloading Cilium's module graph from scratch.
+RUN --mount=type=cache,target=/root/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    GOARCH=riscv64 GOOS=linux CGO_ENABLED=0 go build -o /output/cilium-agent ./daemon && \
+    GOARCH=riscv64 GOOS=linux CGO_ENABLED=0 go build -o /output/cilium-operator-generic ./operator
+
+# Cilium's CNI plugin binary
+RUN --mount=type=cache,target=/root/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    GOARCH=riscv64 GOOS=linux CGO_ENABLED=0 go build -o /output/cni/cilium-cni ./plugins/cilium-cni
+
+# BPF datapath C sources - copied as-is, compiled at agent startup on the
+# target node (see header comment above), not here.
+RUN cp -r bpf /output/bpf
+
+# Final runtime image. Upstream uses a purpose-built cilium-runtime image
+# with clang/llvm/bpftool/iproute2 versions matched to the BPF program
+# sources; that image has no riscv64 variant, so this assembles a
+# clean-room equivalent from Debian's riscv64 packages instead. Versions
+# of clang/iproute2 here come from Debian, not from Cilium's own pinned
+# toolchain - if the startup-time BPF compile fails on real hardware due
+# to a clang/kernel-header mismatch, this is the first place to look.
+# Debian only publishes a riscv64 manifest from trixie (13) onward -
+# bookworm (12) has none.
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang \
+    llvm \
+    iproute2 \
+    iptables \
+    ipset \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=0 /output/cilium-agent /usr/bin/cilium-agent
+COPY --from=0 /output/cilium-operator-generic /usr/bin/cilium-operator-generic
+COPY --from=0 /output/cni/ /cni/
+COPY --from=0 /output/bpf/ /var/lib/cilium/bpf/
+
+CMD ["/usr/bin/cilium-agent"]
