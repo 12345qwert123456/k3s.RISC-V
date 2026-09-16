@@ -108,7 +108,7 @@ jobs:
           mkdir -p bin cni
           docker cp extract:/usr/bin/cilium-agent ./bin/
           docker cp extract:/usr/bin/cilium-operator-generic ./bin/
-          docker cp extract:/cni/ ./cni/
+          docker cp extract:/cni/. ./cni/
           docker rm extract
 
       - name: Verify binaries
