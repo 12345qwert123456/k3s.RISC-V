@@ -2,7 +2,7 @@ name: Build Cilium for RISC-V 64 (experimental)
 
 on:
   schedule:
-    - cron: '0 8 * * *' # daily at 08:00 UTC (offset from the k3s/Calico builds)
+    - cron: '0 8 * * *' # daily at 08:00 UTC (offset from the k3s build)
   workflow_dispatch:
     inputs:
       force:
