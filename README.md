@@ -200,3 +200,7 @@ The main workflow (`build-riscv64.yml`):
 - [k3s-io/k3s](https://github.com/k3s-io/k3s) — upstream k3s project
 - [containernetworking/plugins](https://github.com/containernetworking/plugins) — standard CNI plugins
 - [cilium/cilium](https://github.com/cilium/cilium) — Cilium
+
+## License
+
+Apache License 2.0, the same as upstream [k3s](https://github.com/k3s-io/k3s/blob/master/LICENSE).
